@@ -207,3 +207,4 @@ spark-warehouse/
 # Daniel's gitignore
 checkpoints
 checkpoints/
+src/main/resources/twitter4j.properties
