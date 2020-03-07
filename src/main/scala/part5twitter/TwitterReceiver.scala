@@ -1,5 +1,7 @@
 package part5twitter
 
+import java.io.{OutputStream, PrintStream}
+
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.streaming.receiver.Receiver
 import twitter4j._
@@ -21,8 +23,16 @@ class TwitterReceiver extends Receiver[Status](StorageLevel.MEMORY_ONLY) {
     override def onException(ex: Exception): Unit = ex.printStackTrace()
   }
 
+  private def redirectSystemError() = System.setErr(new PrintStream(new OutputStream {
+    override def write(b: Array[Byte]): Unit = ()
+    override def write(b: Array[Byte], off: Int, len: Int): Unit = ()
+    override def write(b: Int): Unit = ()
+  }))
+
   // run asynchronously
   override def onStart(): Unit = {
+    redirectSystemError()
+
     val twitterStream: TwitterStream = new TwitterStreamFactory("src/main/resources")
       .getInstance()
       .addListener(simpleStatusListener)
