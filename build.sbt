@@ -4,9 +4,9 @@ version := "0.1"
 
 scalaVersion := "2.12.10"
 
-val sparkVersion = "3.0.0-preview"
+val sparkVersion = "3.0.0"
 val postgresVersion = "42.2.2"
-val cassandraConnectorVersion = "2.4.2"
+val cassandraConnectorVersion = "3.0.0-alpha2" // preview version at the moment of writing (July 7, 2020)
 val akkaVersion = "2.5.24"
 val akkaHttpVersion = "10.1.7"
 val twitter4jVersion = "4.0.7"
@@ -36,20 +36,12 @@ libraryDependencies ++= Seq(
 
   // low-level integrations
   "org.apache.spark" %% "spark-streaming-kafka-0-10" % sparkVersion,
-  "org.apache.spark" %% "spark-streaming-kinesis-asl" % sparkVersion,
   
-  /*
-    Flume only works with Spark 2.4.4 at the moment.
-    We will uncomment when we learn how to integrate Flume with Spark. 
-   */
-  // "org.apache.spark" %% "spark-streaming-flume" % sparkVersion,
-
   // akka
   "com.typesafe.akka" %% "akka-remote" % akkaVersion,
   "com.typesafe.akka" %% "akka-stream" % akkaVersion,
   "com.typesafe.akka" %% "akka-http" % akkaHttpVersion,
 
-  // cassandra - this version officially works with Spark 2.4, but tested with Spark 3.0-preview as well
   "com.datastax.spark" %% "spark-cassandra-connector" % cassandraConnectorVersion,
 
   // postgres
