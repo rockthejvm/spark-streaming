@@ -1,18 +1,20 @@
 name := "spark-streaming"
 
-version := "0.1"
+version := "0.2"
 
-scalaVersion := "2.12.10"
+scalaVersion := "2.13.12"
 
-val sparkVersion = "3.0.2"
-val postgresVersion = "42.2.2"
-val cassandraConnectorVersion = "3.0.0" // preview version at the moment of writing (July 7, 2020)
-val akkaVersion = "2.5.24"
-val akkaHttpVersion = "10.1.7"
+val sparkVersion = "3.5.0"
+val postgresVersion = "42.6.0"
+val cassandraConnectorVersion = "3.4.1" // preview version at the moment of writing (October, 2023)
+val akkaVersion = "2.6.19"
+val akkaHttpVersion = "10.2.10"
 val twitter4jVersion = "4.0.7"
-val kafkaVersion = "2.4.0"
-val log4jVersion = "2.4.1"
-val nlpLibVersion = "3.5.1"
+val kafkaVersion = "3.6.0"
+val log4jVersion = "2.20.0"
+val nlpLibVersion = "4.5.4"
+
+evictionErrorLevel := Level.Warn
 
 resolvers ++= Seq(
   "bintray-spark-packages" at "https://dl.bintray.com/spark-packages/maven",
@@ -32,7 +34,7 @@ libraryDependencies ++= Seq(
   "org.apache.spark" %% "spark-streaming" % sparkVersion,
   
   // streaming-kafka
-  "org.apache.spark" % "spark-sql-kafka-0-10_2.12" % sparkVersion,
+  "org.apache.spark" %% "spark-sql-kafka-0-10" % sparkVersion,
 
   // low-level integrations
   "org.apache.spark" %% "spark-streaming-kafka-0-10" % sparkVersion,

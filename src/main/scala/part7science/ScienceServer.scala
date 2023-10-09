@@ -1,21 +1,20 @@
 package part7science
 
 import java.util.Properties
-
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model.{ContentTypes, HttpEntity, StatusCodes}
-import akka.stream.ActorMaterializer
+import akka.stream.Materializer
 import akka.http.scaladsl.server.Directives._
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
 import org.apache.kafka.common.serialization.{LongSerializer, StringSerializer}
-
+import scala.util.Using
 import scala.io.Source
 
 
 object ScienceServer {
   implicit val system = ActorSystem()
-  implicit val materializer = ActorMaterializer()
+  implicit val materializer: Materializer = Materializer(system)
 
   val kafkaTopic = "science"
   val kafkaBootstrapServer = "localhost:9092"
@@ -33,12 +32,14 @@ object ScienceServer {
   def getRoute(producer: KafkaProducer[Long, String]) = {
     pathEndOrSingleSlash {
       get {
-        complete(
-          HttpEntity(
-            ContentTypes.`text/html(UTF-8)`,
-            Source.fromFile("src/main/html/whackamole.html").getLines().mkString("")
-          )
-        )
+        complete {
+          Using(Source.fromFile("src/main/html/whackamole.html")) { source =>
+            HttpEntity(
+              ContentTypes.`text/html(UTF-8)`,
+              source.getLines().mkString("")
+            )
+          }
+        }
       }
     } ~
     path("api" / "report") {
@@ -60,7 +61,7 @@ object ScienceServer {
 
     // spinning up the server
     val kafkaProducer = getProducer()
-    val bindingFuture = Http().bindAndHandle(getRoute(kafkaProducer), "localhost", 9988)
+    val bindingFuture = Http().newServerAt("localhost", 9988).bind(getRoute(kafkaProducer))
 
     // cleanup
     bindingFuture.foreach { binding =>
