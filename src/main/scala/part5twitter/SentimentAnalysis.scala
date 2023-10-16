@@ -7,8 +7,7 @@ import edu.stanford.nlp.neural.rnn.RNNCoreAnnotations
 import edu.stanford.nlp.pipeline.StanfordCoreNLP
 import edu.stanford.nlp.sentiment.SentimentCoreAnnotations
 import edu.stanford.nlp.util.CoreMap
-
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 object SentimentAnalysis {
 
@@ -25,7 +24,7 @@ object SentimentAnalysis {
     // split the text into sentences and attach scores to each
     val sentences = annotation.get(classOf[CoreAnnotations.SentencesAnnotation]).asScala
     val sentiments = sentences.map { sentence: CoreMap =>
-      val tree = sentence.get(classOf[SentimentCoreAnnotations.AnnotatedTree])
+      val tree = sentence.get(classOf[SentimentCoreAnnotations.SentimentAnnotatedTree])
       // convert the score to a double for each sentence
       RNNCoreAnnotations.getPredictedClass(tree).toDouble
     }
