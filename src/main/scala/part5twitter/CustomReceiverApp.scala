@@ -1,38 +1,36 @@
 package part5twitter
 
 import java.net.Socket
-
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.streaming.dstream.DStream
 import org.apache.spark.streaming.receiver.Receiver
 import org.apache.spark.streaming.{Seconds, StreamingContext}
 
-import scala.concurrent.{Future, Promise}
 import scala.io.Source
 
 class CustomSocketReceiver(host: String, port: Int) extends Receiver[String](StorageLevel.MEMORY_ONLY) {
-  import scala.concurrent.ExecutionContext.Implicits.global
 
-  val socketPromise: Promise[Socket] = Promise[Socket]()
-  val socketFuture = socketPromise.future
+  /* This variable is used to store the Socket instance, when the receiver starts, it establishes the socket
+  connection and reads data from the socket.
+     */
+  var mayBeSocket: Option[Socket] = None
 
   // called asynchronously
   override def onStart(): Unit = {
-    val socket = new Socket(host, port)
+    mayBeSocket = Some(new Socket(host, port))
+    val socket = mayBeSocket.get
 
-    // run on another thread
-    Future {
-      Source.fromInputStream(socket.getInputStream)
-        .getLines()
-        .foreach(line => store(line)) // store makes this string available to Spark
-    }
+    // Read data from the socket and store it
+    val source = Source.fromInputStream(socket.getInputStream)
+    source.getLines().foreach(line => store(line))
 
-    socketPromise.success(socket)
+    source.close()
+    socket.close()
   }
 
   // called asynchronously
-  override def onStop(): Unit = socketFuture.foreach(socket => socket.close())
+  override def onStop(): Unit = mayBeSocket.foreach(socket => socket.close())
 }
 
 object CustomReceiverApp {

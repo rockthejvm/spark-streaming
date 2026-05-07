@@ -1,7 +1,7 @@
 package part4integrations
 
 import akka.actor.{Actor, ActorLogging, ActorRef, ActorSystem, Props}
-import akka.stream.{ActorMaterializer, OverflowStrategy}
+import akka.stream.{ActorMaterializer, Materializer, OverflowStrategy}
 import akka.stream.scaladsl.{Sink, Source}
 import com.typesafe.config.ConfigFactory
 import org.apache.spark.sql.{Dataset, SparkSession}
@@ -49,7 +49,7 @@ object IntegratingAkka {
 
 object ReceiverSystem {
   implicit val actorSystem = ActorSystem("ReceiverSystem", ConfigFactory.load("akkaconfig/remoteActors").getConfig("remoteSystem"))
-  implicit val actorMaterializer = ActorMaterializer()
+  implicit val actorMaterializer = Materializer(actorSystem)
 
   class Destination extends Actor with ActorLogging {
     override def receive = {
