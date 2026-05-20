@@ -1,64 +1,42 @@
 name := "spark-streaming"
 
-version := "0.1"
+version := "2.0"
 
-scalaVersion := "2.12.10"
+scalaVersion := "2.13.17"
 
-val sparkVersion = "3.0.2"
-val postgresVersion = "42.2.2"
-val cassandraConnectorVersion = "3.0.0" // preview version at the moment of writing (July 7, 2020)
-val akkaVersion = "2.5.24"
-val akkaHttpVersion = "10.1.7"
-val twitter4jVersion = "4.0.7"
-val kafkaVersion = "2.4.0"
-val log4jVersion = "2.4.1"
-val nlpLibVersion = "3.5.1"
+val sparkVersion = "4.1.1"
+val postgresVersion = "42.7.4"
+val mongoSparkVersion = "10.4.0"
+val kafkaVersion = "3.7.1"
+val log4jVersion = "2.24.3"
 
-resolvers ++= Seq(
-  "bintray-spark-packages" at "https://dl.bintray.com/spark-packages/maven",
-  "Typesafe Simple Repository" at "https://repo.typesafe.com/typesafe/simple/maven-releases",
-  "MavenRepository" at "https://mvnrepository.com"
-)
-
-/*
-  Beware that if you're working on this repository from a work computer,
-  corporate firewalls might block the IDE from downloading the libraries and/or the Docker images in this project.
- */
 libraryDependencies ++= Seq(
   "org.apache.spark" %% "spark-core" % sparkVersion,
   "org.apache.spark" %% "spark-sql" % sparkVersion,
 
-  // streaming
-  "org.apache.spark" %% "spark-streaming" % sparkVersion,
-  
-  // streaming-kafka
-  "org.apache.spark" % "spark-sql-kafka-0-10_2.12" % sparkVersion,
+  // Structured Streaming Kafka connector
+  "org.apache.spark" % "spark-sql-kafka-0-10_2.13" % sparkVersion,
 
-  // low-level integrations
-  "org.apache.spark" %% "spark-streaming-kafka-0-10" % sparkVersion,
-  
-  // akka
-  "com.typesafe.akka" %% "akka-remote" % akkaVersion,
-  "com.typesafe.akka" %% "akka-stream" % akkaVersion,
-  "com.typesafe.akka" %% "akka-http" % akkaHttpVersion,
-
-  "com.datastax.spark" %% "spark-cassandra-connector" % cassandraConnectorVersion,
-
-  // postgres
+  // PostgreSQL
   "org.postgresql" % "postgresql" % postgresVersion,
 
-  // twitter
-  "org.twitter4j" % "twitter4j-core" % twitter4jVersion,
-  "org.twitter4j" % "twitter4j-stream" % twitter4jVersion,
+  // MongoDB
+  "org.mongodb.spark" %% "mongo-spark-connector" % mongoSparkVersion,
 
-  // logging
+  // Kafka client (for the simulator producer)
+  "org.apache.kafka" % "kafka-clients" % kafkaVersion,
+
+  // Logging
   "org.apache.logging.log4j" % "log4j-api" % log4jVersion,
   "org.apache.logging.log4j" % "log4j-core" % log4jVersion,
+  "org.apache.logging.log4j" % "log4j-slf4j2-impl" % log4jVersion
+)
 
-  "edu.stanford.nlp" % "stanford-corenlp" % nlpLibVersion,
-  "edu.stanford.nlp" % "stanford-corenlp" % nlpLibVersion classifier "models",
-
-  // kafka
-  "org.apache.kafka" %% "kafka" % kafkaVersion,
-  "org.apache.kafka" % "kafka-streams" % kafkaVersion
+Compile / run / javaOptions ++= Seq(
+  "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+  "--add-opens=java.base/java.lang=ALL-UNNAMED",
+  "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",
+  "--add-opens=java.base/java.io=ALL-UNNAMED",
+  "--add-opens=java.base/java.util=ALL-UNNAMED",
+  "--add-opens=java.base/java.nio=ALL-UNNAMED"
 )

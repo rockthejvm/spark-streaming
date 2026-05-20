@@ -65,8 +65,9 @@ object StreamingDataFrames {
       .outputMode("append")
       .trigger(
         // Trigger.ProcessingTime(2.seconds) // every 2 seconds run the query
-        // Trigger.Once() // single batch, then terminate
-        Trigger.Continuous(2.seconds) // experimental, every 2 seconds create a batch with whatever you have
+        // Trigger.AvailableNow() // process all available data in multiple micro-batches, then terminate (replaces the deprecated Trigger.Once())
+        // Trigger.RealTime() // Spark 4.1: continuous event-at-a-time processing, sub-millisecond latency (Kafka source/sink only, stateless)
+        Trigger.Continuous(2.seconds) // older continuous mode, largely superseded by RealTime
       )
       .start()
       .awaitTermination()
