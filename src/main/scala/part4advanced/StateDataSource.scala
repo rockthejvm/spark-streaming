@@ -6,6 +6,26 @@ import org.apache.spark.sql.streaming._
 import scala.concurrent.duration.Duration
 import java.util.concurrent.TimeUnit
 
+/*
+  State Data Source — Spark 4's way to inspect streaming state outside a running query.
+
+  Why it exists:
+  When a stateful streaming query runs, its state (ValueState, ListState, MapState) is stored in checkpoints
+  on disk, but it's opaque — you can't just open the files and read them. The State Data Source lets you
+  read that checkpoint data as a regular DataFrame, so you can debug, audit, or analyze state after stopping a query.
+
+  Two formats:
+  - "state-metadata": shows which stateful operators exist, how many partitions, and the range of batch IDs.
+    Use this first to understand what's in the checkpoint.
+  - "statestore": reads the actual key-value state contents for a specific state variable (e.g. "totalCount").
+    You can optionally specify a batchId to see the state as it was at a particular point in time.
+
+  Typical scenario:
+  A stateful query has been running for hours and the results look wrong. You stop the query, use the State
+  Data Source to inspect what's accumulated per key, find the bad state, and decide whether to fix the data
+  and resume or restart from scratch. Also useful for unit testing stateful logic — run a few batches,
+  stop, and assert on the state contents.
+*/
 object StateDataSource {
 
   val spark = SparkSession.builder()
@@ -14,6 +34,9 @@ object StateDataSource {
     .getOrCreate()
 
   import spark.implicits._
+
+  // NOTE: SocialPostRecord, AveragePostStorage, and AverageStorageProcessor are duplicated from
+  // TransformWithState.scala — refactor these into a shared location (e.g. common/) so both files can reuse them.
 
   case class SocialPostRecord(postType: String, count: Int, storageUsed: Int)
   case class AveragePostStorage(postType: String, averageStorage: Double)

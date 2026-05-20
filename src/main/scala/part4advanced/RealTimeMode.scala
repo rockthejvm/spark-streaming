@@ -3,10 +3,27 @@ package part4advanced
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.streaming.Trigger
-import org.apache.spark.sql.types._
 
 import scala.concurrent.duration._
 
+/*
+  Real-Time Mode (Spark 4.1) — event-at-a-time processing with sub-millisecond latency.
+
+  In micro-batch mode, Spark collects events into batches and processes them periodically (e.g. every 1 second).
+  This adds at least one batch interval of latency. Real-Time Mode (Trigger.RealTime()) processes each event
+  individually as soon as it arrives, achieving single-digit millisecond latency.
+
+  To produce test data, run kafka-console-producer from Docker:
+    docker exec -it rockthejvm-sparkstreaming-kafka kafka-console-producer --bootstrap-server localhost:9092 --topic rtm-input
+  Then type messages (one per line). Each message becomes a Kafka record with an automatic timestamp.
+
+  Current limitations (Spark 4.1):
+  - Kafka source only (no socket, file, or rate source)
+  - Kafka and Foreach sinks only (no console sink)
+  - Stateless, single-stage queries only (no aggregations, joins, or transformWithState)
+  - Update output mode only
+  - Exactly-once semantics (improvement over old Trigger.Continuous which was at-least-once)
+*/
 object RealTimeMode {
 
   val spark = SparkSession.builder()
@@ -16,159 +33,106 @@ object RealTimeMode {
 
   import spark.implicits._
 
-  val gitHubEventSchema = StructType(Array(
-    StructField("id", StringType),
-    StructField("type", StringType),
-    StructField("actor", StructType(Array(
-      StructField("login", StringType)
-    ))),
-    StructField("repo", StructType(Array(
-      StructField("name", StringType)
-    ))),
-    StructField("created_at", TimestampType)
-  ))
-
+  // Every Kafka record has: key, value, topic, partition, offset, timestamp, timestampType.
+  // We use "timestamp" (when Kafka received the record) to measure end-to-end latency.
   def readFromKafka(): DataFrame = spark.readStream
     .format("kafka")
     .option("kafka.bootstrap.servers", "localhost:9092")
-    .option("subscribe", "github-events")
+    .option("subscribe", "rtm-input")
     .option("startingOffsets", "latest")
     .load()
-    .selectExpr("CAST(value AS STRING) as json")
-    .select(from_json(col("json"), gitHubEventSchema).as("event"))
     .select(
-      col("event.id").as("id"),
-      col("event.type").as("eventType"),
-      col("event.actor.login").as("actorLogin"),
-      col("event.repo.name").as("repoName"),
-      col("event.created_at").as("createdAt")
+      col("value").cast("string").as("message"),
+      col("timestamp").as("kafkaTimestamp") // when Kafka received the record
     )
 
-  // --- Example 1: Micro-batch baseline ---
+  // --- Example 1: Micro-batch latency baseline ---
+  // Each event waits up to 1 second (the batch interval) before being processed.
+  // The ForeachWriter prints the delay between Kafka ingestion and Spark processing.
 
-  def microBatchPipeline(): Unit = {
+  def microBatchLatency(): Unit = {
     readFromKafka()
       .select(
-        col("eventType"),
-        col("repoName"),
-        current_timestamp().as("processedAt")
-      )
-      .writeStream
-      .format("console")
-      .outputMode("append")
-      .option("truncate", "false")
-      .trigger(Trigger.ProcessingTime(1.second))
-      .start()
-      .awaitTermination()
-  }
-
-  // --- Example 2: Real-Time Mode (same pipeline, just change the trigger) ---
-
-  def realTimePipeline(): Unit = {
-    readFromKafka()
-      .select(
-        col("eventType"),
-        col("repoName"),
-        current_timestamp().as("processedAt")
-      )
-      .writeStream
-      .format("kafka")
-      .option("kafka.bootstrap.servers", "localhost:9092")
-      .option("topic", "github-events-processed")
-      .option("checkpointLocation", "checkpoints/rtm-demo")
-      .trigger(Trigger.RealTime())
-      .start()
-      .awaitTermination()
-  }
-
-  // --- Example 3: Real-Time Mode with checkpoint interval ---
-
-  def realTimeWithCheckpointInterval(): Unit = {
-    readFromKafka()
-      .selectExpr(
-        "CAST(eventType AS STRING) AS key",
-        "CAST(repoName AS STRING) AS value"
-      )
-      .writeStream
-      .format("kafka")
-      .option("kafka.bootstrap.servers", "localhost:9092")
-      .option("topic", "github-events-processed")
-      .option("checkpointLocation", "checkpoints/rtm-interval-demo")
-      .trigger(Trigger.RealTime("5 minutes"))
-      .start()
-      .awaitTermination()
-  }
-
-  // --- Example 4: Real-Time Mode with ForeachSink for latency measurement ---
-
-  def realTimeWithLatencyMeasurement(): Unit = {
-    readFromKafka()
-      .select(
-        col("id"),
-        col("eventType"),
-        col("createdAt"),
+        col("message"),
+        col("kafkaTimestamp"),
         current_timestamp().as("processedAt")
       )
       .writeStream
       .outputMode("update")
       .foreach(new org.apache.spark.sql.ForeachWriter[org.apache.spark.sql.Row] {
         override def open(partitionId: Long, epochId: Long): Boolean = true
-
         override def process(row: org.apache.spark.sql.Row): Unit = {
-          val createdAt = row.getTimestamp(2)
-          val processedAt = row.getTimestamp(3)
-          if (createdAt != null && processedAt != null) {
-            val latencyMs = processedAt.getTime - createdAt.getTime
-            println(s"[RTM] Event ${row.getString(0)} | type=${row.getString(1)} | latency=${latencyMs}ms")
-          }
+          val kafkaTs = row.getTimestamp(1)
+          val processedAt = row.getTimestamp(2)
+          val latencyMs = processedAt.getTime - kafkaTs.getTime
+          println(s"[MICRO-BATCH] message='${row.getString(0)}' | latency=${latencyMs}ms")
         }
-
         override def close(errorOrNull: Throwable): Unit = {}
       })
-      .trigger(Trigger.RealTime())
-      .option("checkpointLocation", "checkpoints/rtm-latency-demo")
+      .trigger(Trigger.ProcessingTime(1.second))
+      .option("checkpointLocation", "checkpoints/rtm-microbatch")
       .start()
       .awaitTermination()
   }
 
-  // --- Example 5: Stateless filter in Real-Time Mode ---
+  // --- Example 2: Real-Time Mode latency ---
+  // Same pipeline, only the trigger changes. Events are processed immediately.
+  // You should see single-digit ms latency vs hundreds of ms in micro-batch.
 
-  def realTimeFilteredPipeline(): Unit = {
+  def realTimeLatency(): Unit = {
     readFromKafka()
-      .filter(col("eventType") === "PushEvent")
+      .select(
+        col("message"),
+        col("kafkaTimestamp"),
+        current_timestamp().as("processedAt")
+      )
+      .writeStream
+      .outputMode("update")
+      .foreach(new org.apache.spark.sql.ForeachWriter[org.apache.spark.sql.Row] {
+        override def open(partitionId: Long, epochId: Long): Boolean = true
+        override def process(row: org.apache.spark.sql.Row): Unit = {
+          val kafkaTs = row.getTimestamp(1)
+          val processedAt = row.getTimestamp(2)
+          val latencyMs = processedAt.getTime - kafkaTs.getTime
+          println(s"[REAL-TIME]   message='${row.getString(0)}' | latency=${latencyMs}ms")
+        }
+        override def close(errorOrNull: Throwable): Unit = {}
+      })
+      .trigger(Trigger.RealTime())
+      .option("checkpointLocation", "checkpoints/rtm-realtime")
+      .start()
+      .awaitTermination()
+  }
+
+  // --- Example 3: Real-Time Mode with stateless filter (Kafka-to-Kafka) ---
+  // Filters messages and forwards them to another Kafka topic.
+  // Demonstrates that stateless transforms (filter, map, select) work in RTM.
+
+  def realTimeFilter(): Unit = {
+    readFromKafka()
+      .filter(length(col("message")) > 5)
       .selectExpr(
-        "CAST(actorLogin AS STRING) AS key",
-        "CAST(repoName AS STRING) AS value"
+        "CAST(message AS STRING) AS key",
+        "CAST(message AS STRING) AS value"
       )
       .writeStream
       .format("kafka")
       .option("kafka.bootstrap.servers", "localhost:9092")
-      .option("topic", "github-push-events")
-      .option("checkpointLocation", "checkpoints/rtm-filter-demo")
+      .option("topic", "rtm-output")
+      .option("checkpointLocation", "checkpoints/rtm-filter")
       .trigger(Trigger.RealTime())
       .start()
       .awaitTermination()
   }
 
   /*
-    Exercises
-
-    1) Run microBatchPipeline() and realTimeWithLatencyMeasurement() side by side (on different topics).
-       Compare the latency printed for each event. RTM should show single-digit to low double-digit ms,
-       while micro-batch should show 100ms+ due to batch scheduling overhead.
-
-    2) Build an RTM pipeline that reads from github-events, filters to WatchEvent (stars) only,
-       and writes to a "github-stars-rt" Kafka topic. Verify with kafka-console-consumer.
-
-    Current limitations of Real-Time Mode (Spark 4.1):
-    - Kafka source only (no socket, file, or rate source)
-    - Kafka and Foreach sinks only (no console sink)
-    - Stateless, single-stage queries only (no aggregations, joins, or transformWithState)
-    - Update output mode only
-    - Exactly-once semantics (improvement over old Trigger.Continuous which was at-least-once)
+    Exercise:
+    Run microBatchLatency() and realTimeLatency() one at a time. In each case, type a few messages
+    into kafka-console-producer and compare the printed latency values.
+    Micro-batch should show ~1000ms+ (the batch interval), Real-Time should show single-digit ms.
    */
 
   def main(args: Array[String]): Unit = {
-    realTimeWithLatencyMeasurement()
+    realTimeLatency()
   }
 }
