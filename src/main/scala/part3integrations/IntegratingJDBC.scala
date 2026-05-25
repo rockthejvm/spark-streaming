@@ -1,7 +1,8 @@
 package part3integrations
 
-import org.apache.spark.sql.{Dataset, SparkSession}
+import org.apache.spark.sql.{Dataset, SaveMode, SparkSession}
 import common._
+import org.apache.spark.sql.streaming.Trigger
 
 object IntegratingJDBC {
 
@@ -36,8 +37,10 @@ object IntegratingJDBC {
           .option("user", user)
           .option("password", password)
           .option("dbtable", "public.cars")
+          .mode(SaveMode.Overwrite)
           .save()
       }
+      .trigger(Trigger.AvailableNow())
       .start()
       .awaitTermination()
 
