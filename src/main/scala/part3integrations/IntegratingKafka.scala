@@ -11,8 +11,10 @@ object IntegratingKafka {
     .master("local[2]")
     .getOrCreate()
 
+  // set this if you're seeing very verbose logs
+  spark.sparkContext.setLogLevel("WARN")
+
   def readFromKafka() = {
-    // https://spark.apache.org/docs/latest/structured-streaming-kafka-integration.html
     val kafkaDF: DataFrame = spark.readStream
       .format("kafka")
       .option("kafka.bootstrap.servers", "localhost:9092")
@@ -68,6 +70,6 @@ object IntegratingKafka {
   }
 
   def main(args: Array[String]): Unit = {
-    writeCarsToKafka()
+    readFromKafka()
   }
 }
