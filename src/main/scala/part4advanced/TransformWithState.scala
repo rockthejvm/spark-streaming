@@ -1,79 +1,80 @@
 package part4advanced
 
-import java.io.PrintStream
-import java.net.ServerSocket
+import org.apache.spark.sql.classic.{Dataset, SparkSession}
+import org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider
+import org.apache.spark.sql.streaming.{ExpiredTimerInfo, ListState, MapState, OutputMode, StatefulProcessor, TTLConfig, TimeMode, TimerValues, ValueState}
+
 import java.time.Duration
 
-import org.apache.spark.sql.{Dataset, Encoder, Encoders, SparkSession}
-import org.apache.spark.sql.streaming._
-
-/*
-  transformWithState — Spark 4's stateful processing API (replaces mapGroupsWithState/flatMapGroupsWithState).
-
-  How it works:
-  1. You group a streaming Dataset by key (groupByKey), then call .transformWithState(processor, timeMode, outputMode).
-  2. Spark creates one instance of your StatefulProcessor PER PARTITION (not per key).
-     - init() is called once when the processor starts — this is where you obtain state handles.
-     - handleInputRows(key, rows, timerValues) is called once per key that has data in the current micro-batch.
-     - handleExpiredTimer(key, timerValues, expiredTimerInfo) is called when a registered timer fires.
-     - close() is called when the query stops.
-
-  State handles (ValueState, ListState, MapState):
-  - Obtained in init() via getHandle.getValueState / getListState / getMapState.
-  - Each handle is scoped to the CURRENT KEY — when handleInputRows is called for key "video",
-    state.get() returns the value previously stored for "video", not for any other key.
-  - State is automatically checkpointed and survives restarts.
-  - ValueState[T]: holds one value per key. Good for counters, accumulators, last-seen timestamps.
-  - ListState[T]: holds an ordered list per key. Good for recent-event buffers, sliding windows.
-  - MapState[K,V]: holds a key-value map per key. Good for sub-category breakdowns, histograms.
-
-  Output:
-  - handleInputRows returns an Iterator of output records — these become rows in the result Dataset.
-  - Returning Iterator.empty means "no output for this key in this batch."
-  - handleExpiredTimer also returns an Iterator, so timers can produce output too.
-*/
 object TransformWithState {
 
   val spark = SparkSession.builder()
-    .appName("Transform With State")
+    .appName("Stateful Computations")
     .master("local[2]")
+    .config(
+      "spark.sql.streaming.stateStore.providerClass",
+      "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider" // necessary for multiple state variables per processor
+    )
     .getOrCreate()
+
+  spark.sparkContext.setLogLevel("WARN")
 
   import spark.implicits._
 
+  // post_type,n_posts,total_storage
   case class SocialPostRecord(postType: String, count: Int, storageUsed: Int)
   case class AveragePostStorage(postType: String, averageStorage: Double)
 
-  // postType,count,storageUsed
-  def readSocialUpdates(): Dataset[SocialPostRecord] = spark.readStream
-    .format("socket")
-    .option("host", "localhost")
-    .option("port", 12345)
-    .load()
-    .as[String]
-    .map { line =>
-      val tokens = line.split(",")
-      SocialPostRecord(tokens(0), tokens(1).trim.toInt, tokens(2).trim.toInt)
-    }
+  /*
+    input: Streaming Dataset grouped by key
+      - batches
+        - partitions
+          - partition 1
+            - key1: [....]
+            - key2: [...]
+          - partition 2
+            - key3: [ ... ]
+          - partition 3
+            - key4: [...]
+            - key5: [...]
+            - key6: [....]
 
-  // --- Example 1: ValueState (basic accumulation) ---
-  // Goal: compute a running average storage per post type, accumulating across all batches.
-  // ValueState holds a single value per key — perfect for counters and running totals.
+    - one StatefulProcessor instantiated PER PARTITION
+      - spark will call init(), ONCE
+      - FOR EVERY KEY on this partition, spark will call handleInputRows(key, all the rows)
+        - produce one or more output rows as an iterator
 
+      for every key { key =>
+        // STATE
+        var totalCount = 0
+        var totalStorage = 0
+
+        batches.foreach { rows =>
+          rows.foreach { post =>
+            totalCount += post.count
+            totalStorage += post.storage
+          }
+
+          APS(key, totalStorage/totalCount)
+        }
+      }
+   */
   class AverageStorageProcessor extends StatefulProcessor[String, SocialPostRecord, AveragePostStorage] {
-    @transient private var totalCount: ValueState[Long] = _
+    // @transient because all stateful processors are serializable and ValueStates are not
+    @transient private var totalCount: ValueState[Long] = _ // HANDLE to a "distributed variable" that you can inspect, read and modify
     @transient private var totalStorage: ValueState[Long] = _
 
     override def init(outputMode: OutputMode, timeMode: TimeMode): Unit = {
-      totalCount = getHandle.getValueState[Long]("totalCount", TTLConfig.NONE)
-      totalStorage = getHandle.getValueState[Long]("totalStorage", TTLConfig.NONE)
+      val ttl =
+        if (timeMode == TimeMode.None()) TTLConfig.NONE
+        else TTLConfig(Duration.ofSeconds(15))
+
+      // initialize your HANDLES to the state variables
+      totalCount = getHandle.getValueState[Long]("totalCount", ttl) // TTLConfig specifies when the state variable is removed from the store, NONE = never remove
+      totalStorage = getHandle.getValueState[Long]("totalStorage", ttl)
     }
 
-    override def handleInputRows(
-      key: String,
-      inputRows: Iterator[SocialPostRecord],
-      timerValues: TimerValues
-    ): Iterator[AveragePostStorage] = {
+    override def handleInputRows(key: String, inputRows: Iterator[SocialPostRecord], timerValues: TimerValues): Iterator[AveragePostStorage] = {
       var count = if (totalCount.exists()) totalCount.get() else 0L
       var storage = if (totalStorage.exists()) totalStorage.get() else 0L
 
@@ -82,205 +83,126 @@ object TransformWithState {
         storage += record.storageUsed
       }
 
+      // update state variables
       totalCount.update(count)
       totalStorage.update(storage)
 
-      Iterator(AveragePostStorage(key, storage.toDouble / count))
+      // emit one or more output rows
+      Iterator(
+        AveragePostStorage(key, storage.toDouble / count)
+      )
+    }
+
+    def handleInputRows_v2(key: String, inputRows: Iterator[SocialPostRecord], timerValues: TimerValues): Iterator[AveragePostStorage] = {
+      val initialCount = if (totalCount.exists()) totalCount.get() else 0L
+      val initialStorage = if (totalStorage.exists()) totalStorage.get() else 0L
+
+      val (batchCount, batchStorage) = inputRows.foldLeft ((0L, 0L)) {
+        case ((currentCount, currentStorage), SocialPostRecord(postType, count, storage)) =>
+          (currentCount + count, currentStorage + storage)
+      }
+
+      // update state variables
+      val newCount = initialCount + batchCount
+      val newStorage = initialStorage + batchStorage
+
+      totalCount.update(newCount)
+      totalStorage.update(newStorage)
+
+      // emit one or more output rows
+      Iterator(
+        AveragePostStorage(key, newStorage.toDouble / newCount)
+      )
     }
   }
 
-  def averageStorageWithValueState(): Unit = {
-    val socialStream = readSocialUpdates()
-
-    val averageByPostType = socialStream
-      .groupByKey(_.postType)
-      .transformWithState(
-        new AverageStorageProcessor(),
-        // TimeMode.None() — we don't use timers or TTL, so no time tracking needed.
-        //   TimeMode.ProcessingTime() — enables processing-time timers and TTL expiration.
-        //   TimeMode.EventTime() — enables event-time timers that fire based on watermark progression.
-        TimeMode.None(),
-        // OutputMode.Update() — emit only rows whose state changed in this batch.
-        //   OutputMode.Append() — emit rows only once, when their state is finalized (e.g. after a window closes).
-        OutputMode.Update()
-      )
-
-    averageByPostType.writeStream
-      .format("console")
-      .outputMode("update")
-      .start()
-      .awaitTermination()
-  }
-
-  // --- Example 2: ListState (sliding window of recent records) ---
-  // Goal: keep the last N records per post type, like a sliding window buffer.
-  // ListState holds an ordered collection of values per key — useful for recent-history tracking.
+  // example 2 - keep the last N records per post type
+  // LIST state
 
   case class RecentActivity(postType: String, recentCounts: List[Int])
 
   class RecentActivityProcessor(windowSize: Int)
     extends StatefulProcessor[String, SocialPostRecord, RecentActivity] {
-
-    @transient private var recentRecords: ListState[Int] = _
+    @transient private var recentRecords: ListState[Int] = _ // best for appending (O(1)), lazy streaming
+    @transient private var recentRecords_v2: ValueState[List[Int]] = _ // best for the List API
 
     override def init(outputMode: OutputMode, timeMode: TimeMode): Unit = {
       recentRecords = getHandle.getListState[Int]("recentRecords", TTLConfig.NONE)
+      recentRecords_v2 = getHandle.getValueState[List[Int]]("recentRecords_v2", TTLConfig.NONE)
     }
 
-    override def handleInputRows(
-      key: String,
-      inputRows: Iterator[SocialPostRecord],
-      timerValues: TimerValues
-    ): Iterator[RecentActivity] = {
-      val existing = if (recentRecords.exists()) recentRecords.get().toList else List.empty[Int]
-      val newCounts = inputRows.map(_.count).toList
-      val allCounts = existing ++ newCounts
-      val window = allCounts.takeRight(windowSize)
+    override def handleInputRows(key: String, inputRows: Iterator[SocialPostRecord], timerValues: TimerValues): Iterator[RecentActivity] = {
+      val existingRecords = if (recentRecords.exists()) recentRecords.get() else Iterator.empty[Int]
+      val newCounts = inputRows.map(_.count)
+      val allCounts = (existingRecords.toList ++ newCounts).takeRight(windowSize)
 
-      recentRecords.clear()
-      window.foreach(recentRecords.appendValue)
+      recentRecords.put(allCounts.toArray)
 
-      Iterator(RecentActivity(key, window))
+      Iterator(RecentActivity(key, allCounts))
+    }
+
+    def handleInputRows_v2(key: String, inputRows: Iterator[SocialPostRecord], timerValues: TimerValues): Iterator[RecentActivity] = {
+      val existingRecords = if (recentRecords_v2.exists()) recentRecords_v2.get() else List()
+      val newCounts = inputRows.map(_.count)
+      val allCounts = existingRecords ++ newCounts
+
+      recentRecords_v2.update(allCounts)
+
+      Iterator(RecentActivity(key, allCounts))
     }
   }
 
-  def recentActivityWithListState(): Unit = {
-    val socialStream = readSocialUpdates()
+  def readSocialUpdates(): Dataset[SocialPostRecord] =
+    spark.readStream
+      .format("socket")
+      .option("host", "localhost")
+      .option("port", 12345)
+      .load()
+      .as[String]
+      .map { line =>
+        val tokens = line.split(",")
+        SocialPostRecord(tokens(0).trim, tokens(1).trim.toInt, tokens(2).trim.toInt)
+      }
 
-    val recentByPostType = socialStream
-      .groupByKey(_.postType)
-      .transformWithState(
-        new RecentActivityProcessor(5),
-        TimeMode.None(), // no timers or TTL needed — we manage the window size manually
-        OutputMode.Update() // emit the updated window for a key every time new data arrives
-      )
-
-    recentByPostType.writeStream
-      .format("console")
-      .outputMode("update")
-      .start()
-      .awaitTermination()
-  }
-
-  // --- Example 3: MapState (count by sub-category) ---
-  // Goal: for each post type, count how many posts fall into each size category (small/medium/large).
-  // MapState holds a key-value map per grouping key — ideal for breakdowns and histograms.
-
+  // breakdown by category (small, medium, large)
   case class PostTypeBreakdown(postType: String, breakdown: Map[String, Long])
 
-  class PostBreakdownProcessor extends StatefulProcessor[String, SocialPostRecord, PostTypeBreakdown] {
+  class PostBreakdownProcessor
+    extends StatefulProcessor[String, SocialPostRecord, PostTypeBreakdown] {
     @transient private var countsBySize: MapState[String, Long] = _
+    // @transient private var countsBySize_v2: ValueState[Map[String, Long]] = _
 
     override def init(outputMode: OutputMode, timeMode: TimeMode): Unit = {
       countsBySize = getHandle.getMapState[String, Long]("countsBySize", TTLConfig.NONE)
     }
 
-    private def sizeCategory(storageUsed: Int): String =
-      if (storageUsed < 1000) "small"
-      else if (storageUsed < 10000) "medium"
-      else "large"
-
-    override def handleInputRows(
-      key: String,
-      inputRows: Iterator[SocialPostRecord],
-      timerValues: TimerValues
-    ): Iterator[PostTypeBreakdown] = {
+    override def handleInputRows(key: String, inputRows: Iterator[SocialPostRecord], timerValues: TimerValues): Iterator[PostTypeBreakdown] = {
       inputRows.foreach { record =>
-        val category = sizeCategory(record.storageUsed)
+        val category = sizeCategory(record)
         val current = if (countsBySize.exists() && countsBySize.containsKey(category)) countsBySize.getValue(category) else 0L
-        countsBySize.updateValue(category, current + record.count)
+        countsBySize.updateValue(category, current + 1)
       }
 
-      val breakdown: Map[String, Long] = if (countsBySize.exists()) {
-        countsBySize.iterator().map(entry => entry._1 -> entry._2).toMap
-      } else Map.empty[String, Long]
+      val breakdown: Map[String, Long] =
+        if (countsBySize.exists()) {
+          countsBySize.iterator().toMap
+        } else Map.empty
 
       Iterator(PostTypeBreakdown(key, breakdown))
     }
-  }
 
-  def postBreakdownWithMapState(): Unit = {
-    val socialStream = readSocialUpdates()
-
-    val breakdownByPostType = socialStream
-      .groupByKey(_.postType)
-      .transformWithState(
-        new PostBreakdownProcessor(),
-        TimeMode.None(), // no timers or TTL — the map grows indefinitely (fine for a small set of categories)
-        OutputMode.Update() // emit the full breakdown for a key whenever it changes
-      )
-
-    breakdownByPostType.writeStream
-      .format("console")
-      .outputMode("update")
-      .start()
-      .awaitTermination()
-  }
-
-  // --- Example 4: TTL-based state expiration ---
-  // Goal: same running average as Example 1, but state auto-expires after 30 seconds of inactivity.
-  // TTL prevents unbounded state growth — if a post type stops receiving data, its state is cleaned up.
-  // Requires TimeMode.ProcessingTime() so Spark can track when each key's state was last accessed.
-
-  class AverageStorageWithTTLProcessor extends StatefulProcessor[String, SocialPostRecord, AveragePostStorage] {
-    @transient private var totalCount: ValueState[Long] = _
-    @transient private var totalStorage: ValueState[Long] = _
-
-    override def init(outputMode: OutputMode, timeMode: TimeMode): Unit = {
-      val ttl = TTLConfig(Duration.ofSeconds(30))
-      totalCount = getHandle.getValueState[Long]("totalCount", ttl)
-      totalStorage = getHandle.getValueState[Long]("totalStorage", ttl)
-    }
-
-    override def handleInputRows(
-      key: String,
-      inputRows: Iterator[SocialPostRecord],
-      timerValues: TimerValues
-    ): Iterator[AveragePostStorage] = {
-      var count = if (totalCount.exists()) totalCount.get() else 0L
-      var storage = if (totalStorage.exists()) totalStorage.get() else 0L
-
-      inputRows.foreach { record =>
-        count += record.count
-        storage += record.storageUsed
-      }
-
-      totalCount.update(count)
-      totalStorage.update(storage)
-
-      Iterator(AveragePostStorage(key, storage.toDouble / count))
+    private def sizeCategory(post: SocialPostRecord): String = {
+      if (post.storageUsed < 1000) "small"
+      else if (post.storageUsed < 20000) "medium"
+      else "large"
     }
   }
 
-  def averageStorageWithTTL(): Unit = {
-    val socialStream = readSocialUpdates()
-
-    val averageByPostType = socialStream
-      .groupByKey(_.postType)
-      .transformWithState(
-        new AverageStorageWithTTLProcessor(),
-        // TimeMode.ProcessingTime() — required for TTL to work. Spark tracks wall-clock time per key
-        //   and automatically clears state that hasn't been updated within the TTL duration.
-        //   TimeMode.None() would cause a runtime error because TTLConfig is set inside the processor.
-        TimeMode.ProcessingTime(),
-        OutputMode.Update()
-      )
-
-    averageByPostType.writeStream
-      .format("console")
-      .outputMode("update")
-      .start()
-      .awaitTermination()
-  }
-
-  // --- Example 5: Processing-time timers ---
-  // Goal: emit periodic summaries every 10 seconds, even if no new data arrives.
-  // Timers let you schedule a callback (handleExpiredTimer) at a future timestamp.
-  // Use case: periodic reporting, session expiration, delayed alerts.
-
+  // example 4 - periodic summaries even if you don't get new data
   case class PeriodicSummary(postType: String, totalCount: Long, totalStorage: Long, summaryType: String)
 
-  class TimerBasedProcessor extends StatefulProcessor[String, SocialPostRecord, PeriodicSummary] {
+  class TimeBasedProcessor
+    extends StatefulProcessor[String, SocialPostRecord, PeriodicSummary] {
     @transient private var totalCount: ValueState[Long] = _
     @transient private var totalStorage: ValueState[Long] = _
 
@@ -289,15 +211,10 @@ object TransformWithState {
       totalStorage = getHandle.getValueState[Long]("totalStorage", TTLConfig.NONE)
     }
 
-    override def handleInputRows(
-      key: String,
-      inputRows: Iterator[SocialPostRecord],
-      timerValues: TimerValues
-    ): Iterator[PeriodicSummary] = {
+    override def handleInputRows(key: String, inputRows: Iterator[SocialPostRecord], timerValues: TimerValues): Iterator[PeriodicSummary] = {
       var count = if (totalCount.exists()) totalCount.get() else 0L
       var storage = if (totalStorage.exists()) totalStorage.get() else 0L
-
-      val wasEmpty = count == 0L
+      val wasEmpty = count == 0L // track if we're at the beginning of data
 
       inputRows.foreach { record =>
         count += record.count
@@ -307,24 +224,19 @@ object TransformWithState {
       totalCount.update(count)
       totalStorage.update(storage)
 
-      // register a timer 10 seconds from now (only when first data arrives)
+      // schedule a timer the first time we see data
       if (wasEmpty) {
-        val expiryMs = timerValues.getCurrentProcessingTimeInMs() + 10000
-        getHandle.registerTimer(expiryMs)
+        getHandle.registerTimer(timerValues.getCurrentProcessingTimeInMs() + 10000)
       }
 
-      Iterator(PeriodicSummary(key, count, storage, "update"))
+      Iterator(PeriodicSummary(key, count, storage, "data-update"))
     }
 
-    override def handleExpiredTimer(
-      key: String,
-      timerValues: TimerValues,
-      expiredTimerInfo: ExpiredTimerInfo
-    ): Iterator[PeriodicSummary] = {
+    override def handleExpiredTimer(key: String, timerValues: TimerValues, expiredTimerInfo: ExpiredTimerInfo): Iterator[PeriodicSummary] = {
       val count = if (totalCount.exists()) totalCount.get() else 0L
       val storage = if (totalStorage.exists()) totalStorage.get() else 0L
 
-      // register the next timer 10 seconds from now
+      // schedule next timer
       val nextExpiryMs = timerValues.getCurrentProcessingTimeInMs() + 10000
       getHandle.registerTimer(nextExpiryMs)
 
@@ -332,202 +244,149 @@ object TransformWithState {
     }
   }
 
-  def timerBasedSummaries(): Unit = {
+  // -------------------------------------- tests
+
+  /*
+    text,3,3000
+    text,4,5000
+    video,1,500000
+    audio,3,60000
+    --
+    text,1,2500
+    audio,2,40000
+    --
+    video, 2, 300000000
+   */
+  def averageStorageWithState() = {
     val socialStream = readSocialUpdates()
 
-    val summaries = socialStream
+    val averageByPostType = socialStream
       .groupByKey(_.postType)
       .transformWithState(
-        new TimerBasedProcessor(),
-        // TimeMode.ProcessingTime() — required for registerTimer() / handleExpiredTimer().
-        //   Timers fire based on wall-clock time: when the processing time exceeds the registered timestamp.
-        //   TimeMode.EventTime() timers fire when the watermark advances past the registered timestamp —
-        //   useful when you want timers tied to the data's own timestamps rather than the system clock.
+        // stateful processor - full logic of the aggregation
+        new AverageStorageProcessor(),
+        // time mode - none, event time and processing time
         TimeMode.ProcessingTime(),
-        // OutputMode.Update() — we emit both on data arrival AND on timer expiry.
-        //   Append mode would also work here, but Update lets us see intermediate results on every batch.
+        // output mode - append, update, complete
         OutputMode.Update()
       )
 
-    summaries.writeStream
+    averageByPostType.writeStream
       .format("console")
-      .outputMode("update")
+      .outputMode(OutputMode.Update())
       .start()
       .awaitTermination()
   }
 
   /*
-    Exercises
-
-    1) Session window with timers:
-       Group input by postType. When data arrives, accumulate counts.
-       Register a timer 30 seconds in the future.
-       When the timer fires without new data, emit the session total and clear state.
-
-    2) Running statistics with MapState:
-       For each postType, maintain min, max, and sum in a MapState.
-       Emit the current min, max, and average after each batch.
+    text,3,3000
+    text,4,5000
+    video,1,500000
+    audio,3,60000
+    --
+    text,1,2500
+    audio,2,40000
+    --
+    video, 2, 300000000
+    --
+    text,5,5000 // 19000/12
+    text,6,7000
+    text,1,7000
    */
-
-  // --- Exercise 1 solution: Session window with timers ---
-
-  case class SessionResult(postType: String, sessionTotal: Long, resultType: String)
-
-  class SessionWindowProcessor extends StatefulProcessor[String, SocialPostRecord, SessionResult] {
-    @transient private var sessionCount: ValueState[Long] = _
-
-    override def init(outputMode: OutputMode, timeMode: TimeMode): Unit = {
-      sessionCount = getHandle.getValueState[Long]("sessionCount", TTLConfig.NONE)
-    }
-
-    override def handleInputRows(
-      key: String,
-      inputRows: Iterator[SocialPostRecord],
-      timerValues: TimerValues
-    ): Iterator[SessionResult] = {
-      var count = if (sessionCount.exists()) sessionCount.get() else 0L
-
-      inputRows.foreach { record =>
-        count += record.count
-      }
-
-      sessionCount.update(count)
-
-      // every time new data arrives, (re)set the session timeout to 30s from now
-      val expiryMs = timerValues.getCurrentProcessingTimeInMs() + 30000
-      getHandle.registerTimer(expiryMs)
-
-      Iterator(SessionResult(key, count, "update"))
-    }
-
-    override def handleExpiredTimer(
-      key: String,
-      timerValues: TimerValues,
-      expiredTimerInfo: ExpiredTimerInfo
-    ): Iterator[SessionResult] = {
-      // timer fired — no new data arrived within 30s, so the session is over
-      val finalCount = if (sessionCount.exists()) sessionCount.get() else 0L
-      sessionCount.clear()
-      Iterator(SessionResult(key, finalCount, "session-closed"))
-    }
-  }
-
-  def sessionWindowWithTimers(): Unit = {
+  def recentActivityWithState() = {
     val socialStream = readSocialUpdates()
 
-    val sessions = socialStream
+    val recentActivityByType = socialStream
       .groupByKey(_.postType)
       .transformWithState(
-        new SessionWindowProcessor(),
-        TimeMode.ProcessingTime(), // needed for registerTimer
+        // stateful processor - full logic of the aggregation
+        new RecentActivityProcessor(5),
+        // time mode - none, event time and processing time
+        TimeMode.None,
+        // output mode - append, update, complete
         OutputMode.Update()
       )
 
-    sessions.writeStream
+    recentActivityByType.writeStream
       .format("console")
-      .outputMode("update")
+      .outputMode(OutputMode.Update())
       .start()
       .awaitTermination()
   }
 
-  // --- Exercise 2 solution: Running statistics with MapState ---
-
-  case class RunningStats(postType: String, min: Int, max: Int, average: Double)
-
-  class RunningStatsProcessor extends StatefulProcessor[String, SocialPostRecord, RunningStats] {
-    @transient private var stats: MapState[String, Long] = _
-
-    override def init(outputMode: OutputMode, timeMode: TimeMode): Unit = {
-      stats = getHandle.getMapState[String, Long]("stats", TTLConfig.NONE)
-    }
-
-    override def handleInputRows(
-      key: String,
-      inputRows: Iterator[SocialPostRecord],
-      timerValues: TimerValues
-    ): Iterator[RunningStats] = {
-      var currentMin = if (stats.exists() && stats.containsKey("min")) stats.getValue("min") else Long.MaxValue
-      var currentMax = if (stats.exists() && stats.containsKey("max")) stats.getValue("max") else Long.MinValue
-      var currentSum = if (stats.exists() && stats.containsKey("sum")) stats.getValue("sum") else 0L
-      var currentCount = if (stats.exists() && stats.containsKey("count")) stats.getValue("count") else 0L
-
-      inputRows.foreach { record =>
-        val v = record.storageUsed.toLong
-        if (v < currentMin) currentMin = v
-        if (v > currentMax) currentMax = v
-        currentSum += v
-        currentCount += 1
-      }
-
-      stats.updateValue("min", currentMin)
-      stats.updateValue("max", currentMax)
-      stats.updateValue("sum", currentSum)
-      stats.updateValue("count", currentCount)
-
-      Iterator(RunningStats(key, currentMin.toInt, currentMax.toInt, currentSum.toDouble / currentCount))
-    }
-  }
-
-  def runningStatsWithMapState(): Unit = {
+  /*
+    text,3,500
+    text,4,5000
+    video,1,500000
+    audio,3,30000
+    --
+    text,1,2500
+    audio,2,60000
+    --
+    video, 2, 3000000
+    --
+    text,5,15000
+    text,6,7000
+    text,1,800
+   */
+  def postBreakdownWithState() = {
     val socialStream = readSocialUpdates()
 
-    val statsByPostType = socialStream
+    val postBreakdownByType = socialStream
       .groupByKey(_.postType)
       .transformWithState(
-        new RunningStatsProcessor(),
-        TimeMode.None(),
+        // stateful processor - full logic of the aggregation
+        new PostBreakdownProcessor,
+        // time mode - none, event time and processing time
+        TimeMode.None,
+        // output mode - append, update, complete
         OutputMode.Update()
       )
 
-    statsByPostType.writeStream
+    postBreakdownByType.writeStream
       .format("console")
-      .outputMode("update")
+      .outputMode(OutputMode.Update())
+      .start()
+      .awaitTermination()
+  }
+
+  /*
+    text,3,500
+    text,4,5000
+    video,1,500000
+    audio,3,30000
+    --
+    text,1,2500
+    audio,2,60000
+    --
+    video, 2, 3000000
+    --
+    text,5,15000
+    text,6,7000
+    text,1,800
+   */
+  def timerBasedSummaries() = {
+    val socialStream = readSocialUpdates()
+
+    val summaries = socialStream
+      .groupByKey(_.postType)
+      .transformWithState(
+        // stateful processor - full logic of the aggregation
+        new TimeBasedProcessor,
+        // processing time required for this example
+        TimeMode.ProcessingTime(),
+        // output mode - append, update, complete
+        OutputMode.Update()
+      )
+
+    summaries.writeStream
+      .format("console")
+      .outputMode(OutputMode.Update())
       .start()
       .awaitTermination()
   }
 
   def main(args: Array[String]): Unit = {
-    averageStorageWithValueState()
-  }
-}
-
-/*
-  Test data (type into netcat: nc -lk 12345):
-
--- batch 1
-text,3,3000
-text,4,5000
-video,1,500000
-audio,3,60000
--- batch 2
-text,1,2500
-audio,2,40000
--- batch 3
-video,2,300000
-*/
-
-// sends data to the socket automatically for deterministic testing
-object TransformWithStateSender {
-  val serverSocket = new ServerSocket(12345)
-  val socket = serverSocket.accept()
-  val printer = new PrintStream(socket.getOutputStream)
-
-  println("socket accepted")
-
-  def sendSocialData(): Unit = {
-    Thread.sleep(5000)
-    printer.println("text,3,3000")
-    printer.println("text,4,5000")
-    printer.println("video,1,500000")
-    printer.println("audio,3,60000")
-    Thread.sleep(3000)
-    printer.println("text,1,2500")
-    printer.println("audio,2,40000")
-    Thread.sleep(3000)
-    printer.println("video,2,300000")
-  }
-
-  def main(args: Array[String]): Unit = {
-    sendSocialData()
+    timerBasedSummaries()
   }
 }
