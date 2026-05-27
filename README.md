@@ -1,6 +1,6 @@
 # Rock the JVM - Spark Streaming with Scala
 
-Companion repository for the [Rock the JVM Spark Streaming with Scala](https://rockthejvm.com/courses/apache-spark-streaming-with-scala) course.
+This repository contains the code we wrote during  [Rock the JVM's Spark Streaming with Scala](https://rockthejvm.com/courses/apache-spark-streaming-with-scala). Unless explicitly mentioned, the code in this repository is exactly what was caught on camera.
 
 ## Prerequisites
 
@@ -9,6 +9,7 @@ Companion repository for the [Rock the JVM Spark Streaming with Scala](https://r
 - **SBT 1.10+**
 - **Docker** and **Docker Compose**
 - **IntelliJ IDEA** (recommended) with the Scala plugin
+=======
 
 ## How to install
 
