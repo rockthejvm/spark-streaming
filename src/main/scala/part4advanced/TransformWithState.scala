@@ -202,7 +202,7 @@ object TransformWithState {
   case class PeriodicSummary(postType: String, totalCount: Long, totalStorage: Long, summaryType: String)
 
   class TimeBasedProcessor
-    extends StatefulProcessor[String, SocialPostRecord, PeriodicSummary] {
+  extends StatefulProcessor[String, SocialPostRecord, PeriodicSummary] {
     @transient private var totalCount: ValueState[Long] = _
     @transient private var totalStorage: ValueState[Long] = _
 

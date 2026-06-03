@@ -18,5 +18,4 @@ package object common {
     StructField("date", DateType),
     StructField("value", DoubleType)
   ))
-
 }
